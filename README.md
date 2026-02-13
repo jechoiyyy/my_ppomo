@@ -17,4 +17,3 @@ React + TypeScript + Node.js + PostgreSQL 기반 포모도로/할일 앱입니�
 2. `cp backend/.env.example backend/.env`
 3. 루트에서 `npm install`
 4. `npm run dev`
-# my_ppomo
