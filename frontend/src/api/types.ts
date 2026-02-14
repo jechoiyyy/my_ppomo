@@ -16,6 +16,7 @@ export type Task = {
   version: number;
   createdAt: string;
   updatedAt: string;
+  completedAt?: string | null;
 };
 
 export type Session = {

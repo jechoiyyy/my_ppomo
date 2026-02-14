@@ -5,6 +5,8 @@ import type { Settings, Session, Task, User } from "./api/types";
 type TaskFilter = "today" | "tomorrow" | "all" | "completed";
 type TimerMode = "focus" | "short_break" | "long_break";
 type TaskPriority = "low" | "medium" | "high";
+type AppView = "dashboard" | "report";
+type ReportRange = "day" | "week" | "month" | "year";
 
 type TaskListResponse = { items: Task[]; page: number; pageSize: number; total: number };
 type DailyStats = { date: string; focusCount: number; totalFocusMinutes: number; completedTasks: number };
@@ -18,12 +20,18 @@ const FILTERS: Array<{ key: TaskFilter; label: string }> = [
   { key: "completed", label: "완료됨" }
 ];
 
+const REPORT_COLUMNS = Array.from({ length: 12 }, (_, i) => i * 2);
+
 export function App() {
+  const [view, setView] = useState<AppView>("dashboard");
+  const [reportRange, setReportRange] = useState<ReportRange>("week");
+
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("admin@local.test");
   const [password, setPassword] = useState("admin1234");
 
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [allTasks, setAllTasks] = useState<Task[]>([]);
   const [filter, setFilter] = useState<TaskFilter>("today");
   const signatureRef = useRef("");
 
@@ -38,6 +46,7 @@ export function App() {
 
   const [activeSession, setActiveSession] = useState<Session | null>(null);
   const [todaySessions, setTodaySessions] = useState<Session[]>([]);
+  const [reportSessions, setReportSessions] = useState<Session[]>([]);
   const [timerMode, setTimerMode] = useState<TimerMode>("short_break");
   const [remaining, setRemaining] = useState(0);
 
@@ -56,11 +65,60 @@ export function App() {
     d.setDate(d.getDate() - 6);
     return d.toISOString().slice(0, 10);
   }, []);
+  const reportStart = useMemo(() => shiftDate(today, -29), [today]);
 
   const selectedTask = tasks.find((task) => task.id === activeTaskId) ?? tasks[0] ?? null;
-  const plannedMinutes = (settings?.focusMin ?? 25) * tasks.reduce((sum, task) => sum + task.estimatePomodoros, 0);
+  const remainingFocusSessions = tasks.reduce(
+    (sum, task) => sum + Math.max(task.estimatePomodoros - task.completedPomodoros, 0),
+    0
+  );
+  const plannedMinutes = calculatePlannedMinutes(remainingFocusSessions, settings);
+  const tasksToCompleteCount = tasks.length;
   const completionRate =
     tasks.length === 0 ? 0 : Math.min(100, Math.round((tasks.filter((task) => task.status === "done").length / tasks.length) * 100));
+
+  const completedFocusSessions = reportSessions.filter(
+    (session) => session.status === "completed" && session.sessionType === "focus"
+  );
+  const totalFocusMinutes = completedFocusSessions.reduce((sum, session) => sum + Math.floor(session.durationSec / 60), 0);
+  const weekFocusMinutes = Object.values(weeklyStats?.days ?? {}).reduce((sum, minutes) => sum + minutes, 0);
+
+  const totalCompletedTasks = allTasks.filter((task) => task.status === "done").length;
+  const weekCompletedTasks = allTasks.filter((task) => {
+    if (!task.completedAt) return false;
+    return task.completedAt.slice(0, 10) >= weeklyStart && task.completedAt.slice(0, 10) < tomorrow;
+  }).length;
+
+  const reportDays = Array.from({ length: 14 }, (_, idx) => shiftDate(today, -idx));
+
+  const heatMap = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const session of completedFocusSessions) {
+      if (!session.endedAt) continue;
+      const ended = new Date(session.endedAt);
+      const dayKey = ended.toISOString().slice(0, 10);
+      const hourBucket = Math.floor(ended.getHours() / 2) * 2;
+      const key = `${dayKey}-${hourBucket}`;
+      map.set(key, (map.get(key) ?? 0) + 1);
+    }
+    return map;
+  }, [completedFocusSessions]);
+
+  const focusedMinutesByRange = useMemo(() => {
+    const now = new Date(`${today}T23:59:59`);
+    let startDate = new Date(`${today}T00:00:00`);
+    if (reportRange === "week") startDate = new Date(`${weeklyStart}T00:00:00`);
+    if (reportRange === "month") startDate = new Date(`${shiftDate(today, -29)}T00:00:00`);
+    if (reportRange === "year") startDate = new Date(`${shiftDate(today, -364)}T00:00:00`);
+
+    return completedFocusSessions
+      .filter((session) => {
+        if (!session.endedAt) return false;
+        const end = new Date(session.endedAt);
+        return end >= startDate && end <= now;
+      })
+      .reduce((sum, session) => sum + Math.floor(session.durationSec / 60), 0);
+  }, [completedFocusSessions, reportRange, today, weeklyStart]);
 
   async function bootstrap(): Promise<void> {
     try {
@@ -76,15 +134,18 @@ export function App() {
   }
 
   async function loadData(nextFilter: TaskFilter): Promise<void> {
-    const [taskRes, settingRes, dailyRes, weeklyRes, sessionRes] = await Promise.all([
+    const [taskRes, allTaskRes, settingRes, dailyRes, weeklyRes, sessionRes, reportSessionRes] = await Promise.all([
       apiFetch<TaskListResponse>(`/tasks?filter=${nextFilter}&page=1&pageSize=100`),
+      apiFetch<TaskListResponse>("/tasks?filter=all&page=1&pageSize=100"),
       apiFetch<Settings>("/settings"),
       apiFetch<DailyStats>(`/stats/daily?date=${today}`),
       apiFetch<WeeklyStats>(`/stats/weekly?start=${weeklyStart}`),
-      apiFetch<SessionListResponse>(`/sessions?from=${today}&to=${tomorrow}&page=1&pageSize=20`)
+      apiFetch<SessionListResponse>(`/sessions?from=${today}&to=${tomorrow}&page=1&pageSize=20`),
+      apiFetch<SessionListResponse>(`/sessions?from=${reportStart}&to=${tomorrow}&page=1&pageSize=100`)
     ]);
 
     setTasks(taskRes.items);
+    setAllTasks(allTaskRes.items);
     signatureRef.current = taskRes.items.map((t) => `${t.id}:${t.version}:${t.updatedAt}`).join("|");
 
     setSettings(settingRes);
@@ -92,6 +153,7 @@ export function App() {
     setTodayStats(dailyRes);
     setWeeklyStats(weeklyRes);
     setTodaySessions(sessionRes.items);
+    setReportSessions(reportSessionRes.items);
   }
 
   async function refreshTasksSilently(): Promise<void> {
@@ -359,11 +421,13 @@ export function App() {
     setTokens(null);
     setUser(null);
     setTasks([]);
+    setAllTasks([]);
     setSettings(null);
     setSettingsDraft(null);
     setTodayStats(null);
     setWeeklyStats(null);
     setTodaySessions([]);
+    setReportSessions([]);
     setActiveSession(null);
     setWarning(null);
   }
@@ -395,6 +459,10 @@ export function App() {
     <main className="app-shell">
       <header className="app-topbar">
         <div className="brand">Focus To-Do</div>
+        <div className="top-nav-switch">
+          <button className={view === "dashboard" ? "active-tab" : ""} onClick={() => setView("dashboard")}>대시보드</button>
+          <button className={view === "report" ? "active-tab" : ""} onClick={() => setView("report")}>보고서</button>
+        </div>
         <div className="user-chip">
           <span>{user.email}</span>
           <button onClick={() => void logout()}>로그아웃</button>
@@ -404,284 +472,368 @@ export function App() {
       {warning && <p className="warning toast">{warning}</p>}
       {error && <p className="error toast">{error}</p>}
 
-      <section className="workspace">
-        <aside className="left-nav panel">
-          <input className="search" placeholder="검색" />
-          <nav>
-            {FILTERS.map((entry) => (
-              <button
-                key={entry.key}
-                className={`nav-item ${filter === entry.key ? "is-active" : ""}`}
-                onClick={() => setFilter(entry.key)}
-              >
-                <span>{entry.label}</span>
-                <small>{entry.key === "today" ? `${todayStats?.focusCount ?? 0}` : tasks.length}</small>
-              </button>
-            ))}
-          </nav>
-        </aside>
+      {view === "dashboard" ? (
+        <section className="workspace">
+          <aside className="left-nav panel">
+            <input className="search" placeholder="검색" />
+            <nav>
+              {FILTERS.map((entry) => (
+                <button
+                  key={entry.key}
+                  className={`nav-item ${filter === entry.key ? "is-active" : ""}`}
+                  onClick={() => setFilter(entry.key)}
+                >
+                  <span>{entry.label}</span>
+                  <small>{entry.key === "today" ? `${todayStats?.focusCount ?? 0}` : tasks.length}</small>
+                </button>
+              ))}
+            </nav>
+          </aside>
 
-        <section className="board">
-          <h2 className="board-title">오늘</h2>
+          <section className="board">
+            <h2 className="board-title">오늘</h2>
 
-          <div className="summary-grid panel">
-            <div>
-              <strong>{Math.floor(plannedMinutes / 60)}시간 {plannedMinutes % 60}분</strong>
-              <span>예정 시간</span>
+            <div className="summary-grid panel">
+              <div>
+                <strong>{Math.floor(plannedMinutes / 60)}시간 {plannedMinutes % 60}분</strong>
+                <span>예정 시간</span>
+              </div>
+              <div>
+                <strong>{tasksToCompleteCount}</strong>
+                <span>완료할 작업</span>
+              </div>
+              <div>
+                <strong>{Math.floor((todayStats?.totalFocusMinutes ?? 0) / 60)}시간 {(todayStats?.totalFocusMinutes ?? 0) % 60}분</strong>
+                <span>완료한 시간</span>
+              </div>
+              <div>
+                <strong>{todayStats?.completedTasks ?? 0}</strong>
+                <span>완료한 작업</span>
+              </div>
             </div>
-            <div>
-              <strong>{todayStats?.focusCount ?? 0}</strong>
-              <span>완료한 세션</span>
-            </div>
-            <div>
-              <strong>{Math.floor((todayStats?.totalFocusMinutes ?? 0) / 60)}시간 {(todayStats?.totalFocusMinutes ?? 0) % 60}분</strong>
-              <span>완료한 시간</span>
-            </div>
-            <div>
-              <strong>{todayStats?.completedTasks ?? 0}</strong>
-              <span>완료한 작업</span>
-            </div>
-          </div>
 
-          <div className="progress-strip panel">
-            <span>오늘 완료율</span>
-            <div className="bar">
-              <i style={{ width: `${completionRate}%` }} />
+            <div className="progress-strip panel">
+              <span>오늘 완료율</span>
+              <div className="bar">
+                <i style={{ width: `${completionRate}%` }} />
+              </div>
+              <strong>{completionRate}%</strong>
             </div>
-            <strong>{completionRate}%</strong>
-          </div>
 
-          <form onSubmit={addTask} className="quick-add panel">
-            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="할 일에 작업 추가하기" maxLength={200} />
-            <select value={composePriority} onChange={(e) => setComposePriority(e.target.value as TaskPriority)}>
-              <option value="high">high</option>
-              <option value="medium">medium</option>
-              <option value="low">low</option>
-            </select>
-            <input
-              type="number"
-              min={1}
-              max={12}
-              value={composeEstimate}
-              onChange={(e) => setComposeEstimate(Math.max(1, Number(e.target.value) || 1))}
-            />
-            <button type="submit">추가</button>
-          </form>
+            <form onSubmit={addTask} className="quick-add panel">
+              <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="할 일에 작업 추가하기" maxLength={200} />
+              <select value={composePriority} onChange={(e) => setComposePriority(e.target.value as TaskPriority)}>
+                <option value="high">high</option>
+                <option value="medium">medium</option>
+                <option value="low">low</option>
+              </select>
+              <input
+                type="number"
+                min={1}
+                max={12}
+                value={composeEstimate}
+                onChange={(e) => setComposeEstimate(Math.max(1, Number(e.target.value) || 1))}
+              />
+              <button type="submit">추가</button>
+            </form>
 
-          <div className="task-block">
-            <h3>할 일</h3>
-            <ul className="task-list-modern">
-              {tasks.map((task) => (
-                <li key={task.id} className={`task-row ${selectedTask?.id === task.id ? "selected" : ""}`}>
-                  <label className="task-main" onClick={() => setActiveTaskId(task.id)}>
-                    <input
-                      type="radio"
-                      checked={activeTaskId === task.id}
-                      onChange={() => setActiveTaskId(task.id)}
-                      name="activeTask"
-                    />
-                    <span className={task.status === "done" ? "done" : ""}>{task.title}</span>
-                  </label>
-                  <div className="task-meta">
-                    <small className={`priority ${task.priority}`}>{task.priority}</small>
-                    <small>
-                      {task.completedPomodoros}/{task.estimatePomodoros}
-                    </small>
-                    {task.status !== "done" && (
-                      <button onClick={() => void updateTask(task, { status: "done" })} className="ghost-btn">
-                        완료
+            <div className="task-block">
+              <h3>할 일</h3>
+              <ul className="task-list-modern">
+                {tasks.map((task) => (
+                  <li key={task.id} className={`task-row ${selectedTask?.id === task.id ? "selected" : ""}`}>
+                    <label className="task-main" onClick={() => setActiveTaskId(task.id)}>
+                      <input
+                        type="radio"
+                        checked={activeTaskId === task.id}
+                        onChange={() => setActiveTaskId(task.id)}
+                        name="activeTask"
+                      />
+                      <span className={task.status === "done" ? "done" : ""}>{task.title}</span>
+                    </label>
+                    <div className="task-meta">
+                      <small className={`priority ${task.priority}`}>{task.priority}</small>
+                      <small>
+                        {task.completedPomodoros}/{task.estimatePomodoros}
+                      </small>
+                      {task.status !== "done" && (
+                        <button onClick={() => void updateTask(task, { status: "done" })} className="ghost-btn">
+                          완료
+                        </button>
+                      )}
+                      <button onClick={() => void updateTask(task, { plannedDate: today })} className="ghost-btn">
+                        오늘
                       </button>
-                    )}
-                    <button onClick={() => void updateTask(task, { plannedDate: today })} className="ghost-btn">
-                      오늘
-                    </button>
-                    <button onClick={() => void updateTask(task, { plannedDate: tomorrow })} className="ghost-btn">
-                      내일
-                    </button>
-                    <button className="danger-btn" onClick={() => void removeTask(task.id)}>
-                      삭제
-                    </button>
-                  </div>
+                      <button onClick={() => void updateTask(task, { plannedDate: tomorrow })} className="ghost-btn">
+                        내일
+                      </button>
+                      <button className="danger-btn" onClick={() => void removeTask(task.id)}>
+                        삭제
+                      </button>
+                    </div>
+                  </li>
+                ))}
+                {tasks.length === 0 && <li className="empty">목록이 비어 있습니다.</li>}
+              </ul>
+            </div>
+
+            <div className="timer-dock panel">
+              <div className="mode-switch">
+                <button className={timerMode === "focus" ? "is-active" : ""} onClick={() => setTimerMode("focus")}>Focus</button>
+                <button className={timerMode === "short_break" ? "is-active" : ""} onClick={() => setTimerMode("short_break")}>Short</button>
+                <button className={timerMode === "long_break" ? "is-active" : ""} onClick={() => setTimerMode("long_break")}>Long</button>
+              </div>
+              <div className="dock-time">{formatClock(activeSession ? remaining : getModeDurationSec(timerMode))}</div>
+              <div className="dock-actions">
+                <button onClick={() => void startSession(timerMode)} disabled={Boolean(activeSession) || !settings}>
+                  시작
+                </button>
+                <button onClick={() => void completeSession()} disabled={!activeSession}>
+                  완료
+                </button>
+                <button onClick={() => void cancelSession()} disabled={!activeSession}>
+                  취소
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <aside className="right-panel panel">
+            <h3>{selectedTask?.title ?? "작업 상세"}</h3>
+            <p>타입: {activeSession?.sessionType ?? timerMode}</p>
+            <p>
+              포모도로: {selectedTask?.completedPomodoros ?? 0}/{selectedTask?.estimatePomodoros ?? 0}
+            </p>
+
+            {selectedTask && (
+              <div className="task-editor">
+                <label>
+                  설명
+                  <textarea
+                    rows={3}
+                    value={taskDetailDescription}
+                    onChange={(e) => setTaskDetailDescription(e.target.value)}
+                    placeholder="노트 추가..."
+                  />
+                </label>
+                <div className="row2">
+                  <label>
+                    우선순위
+                    <select
+                      value={taskDetailPriority}
+                      onChange={(e) => setTaskDetailPriority(e.target.value as TaskPriority)}
+                    >
+                      <option value="high">high</option>
+                      <option value="medium">medium</option>
+                      <option value="low">low</option>
+                    </select>
+                  </label>
+                  <label>
+                    예상 Pomodoro
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={taskDetailEstimate}
+                      onChange={(e) => setTaskDetailEstimate(Math.max(1, Number(e.target.value) || 1))}
+                    />
+                  </label>
+                </div>
+                <button onClick={() => void saveTaskDetail()}>작업 상세 저장</button>
+              </div>
+            )}
+
+            <div className="divider" />
+            <h4>오늘 집중시간</h4>
+            <p className="focus-time">{todayStats?.totalFocusMinutes ?? 0}분</p>
+
+            <h4>오늘 세션 기록</h4>
+            <ul className="session-list">
+              {todaySessions.slice(0, 8).map((session) => (
+                <li key={session.id}>
+                  <span>{session.sessionType}</span>
+                  <b>{session.status}</b>
                 </li>
               ))}
-              {tasks.length === 0 && <li className="empty">목록이 비어 있습니다.</li>}
+              {todaySessions.length === 0 && <li className="empty">기록 없음</li>}
             </ul>
+
+            <h4>최근 7일 기록</h4>
+            <ul className="weekly-list">
+              {Object.entries(weeklyStats?.days ?? {}).map(([date, minutes]) => (
+                <li key={date}>
+                  <span>{date}</span>
+                  <strong>{minutes}m</strong>
+                </li>
+              ))}
+            </ul>
+
+            {settingsDraft && (
+              <form onSubmit={saveSettings} className="settings-form">
+                <h4>설정</h4>
+                <div className="row2">
+                  <label>
+                    Focus
+                    <input
+                      type="number"
+                      min={1}
+                      max={120}
+                      value={settingsDraft.focusMin}
+                      onChange={(e) => setSettingsDraft({ ...settingsDraft, focusMin: Number(e.target.value) })}
+                    />
+                  </label>
+                  <label>
+                    Short
+                    <input
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={settingsDraft.shortBreakMin}
+                      onChange={(e) => setSettingsDraft({ ...settingsDraft, shortBreakMin: Number(e.target.value) })}
+                    />
+                  </label>
+                </div>
+                <div className="row2">
+                  <label>
+                    Long
+                    <input
+                      type="number"
+                      min={1}
+                      max={120}
+                      value={settingsDraft.longBreakMin}
+                      onChange={(e) => setSettingsDraft({ ...settingsDraft, longBreakMin: Number(e.target.value) })}
+                    />
+                  </label>
+                  <label>
+                    Interval
+                    <input
+                      type="number"
+                      min={2}
+                      max={10}
+                      value={settingsDraft.longBreakInterval}
+                      onChange={(e) => setSettingsDraft({ ...settingsDraft, longBreakInterval: Number(e.target.value) })}
+                    />
+                  </label>
+                </div>
+                <label>
+                  Timezone
+                  <input
+                    value={settingsDraft.timezone}
+                    onChange={(e) => setSettingsDraft({ ...settingsDraft, timezone: e.target.value })}
+                  />
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.autoStartBreak}
+                    onChange={(e) => setSettingsDraft({ ...settingsDraft, autoStartBreak: e.target.checked })}
+                  />
+                  Focus 완료 후 자동 Break 시작
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.autoStartFocus}
+                    onChange={(e) => setSettingsDraft({ ...settingsDraft, autoStartFocus: e.target.checked })}
+                  />
+                  Break 완료 후 자동 Focus 시작
+                </label>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.soundEnabled}
+                    onChange={(e) => setSettingsDraft({ ...settingsDraft, soundEnabled: e.target.checked })}
+                  />
+                  완료 사운드 사용
+                </label>
+                <button type="submit">저장</button>
+              </form>
+            )}
+          </aside>
+        </section>
+      ) : (
+        <section className="report-page">
+          <h2 className="report-title">보고서</h2>
+
+          <div className="report-card-grid">
+            <article className="panel report-card">
+              <span>포모도로 총 시간</span>
+              <strong>{Math.floor(totalFocusMinutes / 60)}시간 {totalFocusMinutes % 60}분</strong>
+            </article>
+            <article className="panel report-card">
+              <span>이번 주 포모도로 시간</span>
+              <strong>{Math.floor(weekFocusMinutes / 60)}시간 {weekFocusMinutes % 60}분</strong>
+            </article>
+            <article className="panel report-card">
+              <span>오늘 포모도로 시간</span>
+              <strong>{todayStats?.totalFocusMinutes ?? 0}분</strong>
+            </article>
+            <article className="panel report-card blue">
+              <span>총 완료된 작업</span>
+              <strong>{totalCompletedTasks}</strong>
+            </article>
+            <article className="panel report-card blue">
+              <span>이번 주 완료된 작업</span>
+              <strong>{weekCompletedTasks}</strong>
+            </article>
+            <article className="panel report-card blue">
+              <span>오늘 완료된 작업</span>
+              <strong>{todayStats?.completedTasks ?? 0}</strong>
+            </article>
           </div>
 
-          <div className="timer-dock panel">
-            <div className="mode-switch">
-              <button className={timerMode === "focus" ? "is-active" : ""} onClick={() => setTimerMode("focus")}>Focus</button>
-              <button className={timerMode === "short_break" ? "is-active" : ""} onClick={() => setTimerMode("short_break")}>Short</button>
-              <button className={timerMode === "long_break" ? "is-active" : ""} onClick={() => setTimerMode("long_break")}>Long</button>
-            </div>
-            <div className="dock-time">{formatClock(activeSession ? remaining : getModeDurationSec(timerMode))}</div>
-            <div className="dock-actions">
-              <button onClick={() => void startSession(timerMode)} disabled={Boolean(activeSession) || !settings}>
-                시작
-              </button>
-              <button onClick={() => void completeSession()} disabled={!activeSession}>
-                완료
-              </button>
-              <button onClick={() => void cancelSession()} disabled={!activeSession}>
-                취소
-              </button>
-            </div>
+          <div className="report-layout">
+            <section className="panel focus-heatmap">
+              <h3>포모도로 기록</h3>
+              <div className="heatmap-head">
+                <span />
+                {REPORT_COLUMNS.map((hour) => (
+                  <span key={hour}>{hour}:00</span>
+                ))}
+              </div>
+              <div className="heatmap-grid">
+                {reportDays.map((date) => (
+                  <div key={date} className="heatmap-row">
+                    <span>{date === today ? "오늘" : date.slice(5)}</span>
+                    {REPORT_COLUMNS.map((hour) => {
+                      const level = heatMap.get(`${date}-${hour}`) ?? 0;
+                      return <i key={`${date}-${hour}`} className={`heat-cell lv-${Math.min(level, 4)}`} />;
+                    })}
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <aside className="panel focus-side">
+              <div className="focus-side-head">
+                <h3>집중한 시간</h3>
+                <small>총 집중 시간: {focusedMinutesByRange}분</small>
+              </div>
+
+              <div className="range-tabs">
+                <button className={reportRange === "day" ? "active-tab" : ""} onClick={() => setReportRange("day")}>일간</button>
+                <button className={reportRange === "week" ? "active-tab" : ""} onClick={() => setReportRange("week")}>주간</button>
+                <button className={reportRange === "month" ? "active-tab" : ""} onClick={() => setReportRange("month")}>월간</button>
+                <button className={reportRange === "year" ? "active-tab" : ""} onClick={() => setReportRange("year")}>연간</button>
+              </div>
+
+              <div className="range-total">
+                <strong>{minutesToText(focusedMinutesByRange)}</strong>
+                <p>선택한 기간의 집중 시간 합계</p>
+              </div>
+
+              <ul className="weekly-list">
+                {Object.entries(weeklyStats?.days ?? {}).slice(0, 8).map(([date, minutes]) => (
+                  <li key={date}>
+                    <span>{date}</span>
+                    <strong>{minutes}m</strong>
+                  </li>
+                ))}
+              </ul>
+            </aside>
           </div>
         </section>
-
-        <aside className="right-panel panel">
-          <h3>{selectedTask?.title ?? "작업 상세"}</h3>
-          <p>타입: {activeSession?.sessionType ?? timerMode}</p>
-          <p>
-            포모도로: {selectedTask?.completedPomodoros ?? 0}/{selectedTask?.estimatePomodoros ?? 0}
-          </p>
-
-          {selectedTask && (
-            <div className="task-editor">
-              <label>
-                설명
-                <textarea
-                  rows={3}
-                  value={taskDetailDescription}
-                  onChange={(e) => setTaskDetailDescription(e.target.value)}
-                  placeholder="노트 추가..."
-                />
-              </label>
-              <div className="row2">
-                <label>
-                  우선순위
-                  <select
-                    value={taskDetailPriority}
-                    onChange={(e) => setTaskDetailPriority(e.target.value as TaskPriority)}
-                  >
-                    <option value="high">high</option>
-                    <option value="medium">medium</option>
-                    <option value="low">low</option>
-                  </select>
-                </label>
-                <label>
-                  예상 Pomodoro
-                  <input
-                    type="number"
-                    min={1}
-                    max={20}
-                    value={taskDetailEstimate}
-                    onChange={(e) => setTaskDetailEstimate(Math.max(1, Number(e.target.value) || 1))}
-                  />
-                </label>
-              </div>
-              <button onClick={() => void saveTaskDetail()}>작업 상세 저장</button>
-            </div>
-          )}
-
-          <div className="divider" />
-          <h4>오늘 집중시간</h4>
-          <p className="focus-time">{todayStats?.totalFocusMinutes ?? 0}분</p>
-
-          <h4>오늘 세션 기록</h4>
-          <ul className="session-list">
-            {todaySessions.slice(0, 8).map((session) => (
-              <li key={session.id}>
-                <span>{session.sessionType}</span>
-                <b>{session.status}</b>
-              </li>
-            ))}
-            {todaySessions.length === 0 && <li className="empty">기록 없음</li>}
-          </ul>
-
-          <h4>최근 7일 기록</h4>
-          <ul className="weekly-list">
-            {Object.entries(weeklyStats?.days ?? {}).map(([date, minutes]) => (
-              <li key={date}>
-                <span>{date}</span>
-                <strong>{minutes}m</strong>
-              </li>
-            ))}
-          </ul>
-
-          {settingsDraft && (
-            <form onSubmit={saveSettings} className="settings-form">
-              <h4>설정</h4>
-              <div className="row2">
-                <label>
-                  Focus
-                  <input
-                    type="number"
-                    min={1}
-                    max={120}
-                    value={settingsDraft.focusMin}
-                    onChange={(e) => setSettingsDraft({ ...settingsDraft, focusMin: Number(e.target.value) })}
-                  />
-                </label>
-                <label>
-                  Short
-                  <input
-                    type="number"
-                    min={1}
-                    max={60}
-                    value={settingsDraft.shortBreakMin}
-                    onChange={(e) => setSettingsDraft({ ...settingsDraft, shortBreakMin: Number(e.target.value) })}
-                  />
-                </label>
-              </div>
-              <div className="row2">
-                <label>
-                  Long
-                  <input
-                    type="number"
-                    min={1}
-                    max={120}
-                    value={settingsDraft.longBreakMin}
-                    onChange={(e) => setSettingsDraft({ ...settingsDraft, longBreakMin: Number(e.target.value) })}
-                  />
-                </label>
-                <label>
-                  Interval
-                  <input
-                    type="number"
-                    min={2}
-                    max={10}
-                    value={settingsDraft.longBreakInterval}
-                    onChange={(e) => setSettingsDraft({ ...settingsDraft, longBreakInterval: Number(e.target.value) })}
-                  />
-                </label>
-              </div>
-              <label>
-                Timezone
-                <input
-                  value={settingsDraft.timezone}
-                  onChange={(e) => setSettingsDraft({ ...settingsDraft, timezone: e.target.value })}
-                />
-              </label>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={settingsDraft.autoStartBreak}
-                  onChange={(e) => setSettingsDraft({ ...settingsDraft, autoStartBreak: e.target.checked })}
-                />
-                Focus 완료 후 자동 Break 시작
-              </label>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={settingsDraft.autoStartFocus}
-                  onChange={(e) => setSettingsDraft({ ...settingsDraft, autoStartFocus: e.target.checked })}
-                />
-                Break 완료 후 자동 Focus 시작
-              </label>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={settingsDraft.soundEnabled}
-                  onChange={(e) => setSettingsDraft({ ...settingsDraft, soundEnabled: e.target.checked })}
-                />
-                완료 사운드 사용
-              </label>
-              <button type="submit">저장</button>
-            </form>
-          )}
-        </aside>
-      </section>
+      )}
     </main>
   );
 }
@@ -697,4 +849,28 @@ function shiftDate(dateISO: string, days: number): string {
   const d = new Date(`${dateISO}T00:00:00`);
   d.setDate(d.getDate() + days);
   return d.toISOString().slice(0, 10);
+}
+
+function calculatePlannedMinutes(focusSessions: number, settings: Settings | null): number {
+  if (focusSessions <= 0) return 0;
+
+  const focusMin = settings?.focusMin ?? 25;
+  const shortBreakMin = settings?.shortBreakMin ?? 5;
+  const longBreakMin = settings?.longBreakMin ?? 15;
+  const longBreakInterval = Math.max(settings?.longBreakInterval ?? 4, 2);
+
+  const breakSlots = Math.max(focusSessions - 1, 0);
+  const longBreakCount = Math.floor(breakSlots / longBreakInterval);
+  const shortBreakCount = breakSlots - longBreakCount;
+
+  return focusSessions * focusMin + shortBreakCount * shortBreakMin + longBreakCount * longBreakMin;
+}
+
+function minutesToText(minutes: number): string {
+  if (minutes <= 0) return "0분";
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h <= 0) return `${m}분`;
+  if (m <= 0) return `${h}시간`;
+  return `${h}시간 ${m}분`;
 }

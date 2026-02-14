@@ -207,7 +207,7 @@
 - `db`: PostgreSQL
 
 ## 9.2 네트워크/포트 (예시)
-- frontend: `http://localhost:5173`
+- frontend: `http://localhost:4242`
 - backend: `http://localhost:8080`
 - db: `5432` (외부 노출은 선택)
 
